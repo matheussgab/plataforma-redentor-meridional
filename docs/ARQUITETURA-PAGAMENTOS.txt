@@ -1,0 +1,439 @@
+===============================================================================
+ PAGAMENTOS RECORRENTES E DOAÇÕES COM ASAAS + SUPABASE
+ Panorama de arquitetura para replicar em outros sites de cliente do MA24
+===============================================================================
+
+Referência viva: este repositório (ma24-app-terreiro, T.E.U. Cobra Coral).
+Tudo aqui foi construído e testado nele. Ao implementar em outro site,
+copie os arquivos indicados e troque o prefixo "terreiro_" pelo do cliente.
+
+Escrito em 04/10/2026. Taxas e limites do Asaas mudam: confira antes de
+prometer valores ao cliente.
+
+
+-------------------------------------------------------------------------------
+ 1. A IDEIA EM UMA TELA
+-------------------------------------------------------------------------------
+
+  Visitante                Site do cliente (Next.js na Vercel)        Asaas
+  ---------                ------------------------------------      -----
+  escolhe plano/valor  ->  POST /api/doacao
+                             - valida (zod), decide o valor
+                             - cria cliente + cobrança/assinatura ->  conta Asaas
+                               COM split p/ carteira do MA24          DO CLIENTE
+                             - grava "pendente" no Supabase
+                           <- devolve QR do Pix ou link do cartão
+  paga no app do banco
+  ou na página do Asaas  ---------------------------------------->  recebe
+                                                                      divide:
+                                                                      X% -> MA24
+                                                                      resto -> cliente
+                           POST /api/asaas/webhook  <-------------  avisa "pago"
+                             - confere token, grava evento,
+                               marca "pago" (idempotente)
+  tela do Pix pergunta  -> GET /api/doacao/status (só lê)
+  "já caiu?"
+
+  Dono do site  ->  /login  ->  /painel (lê do Supabase, RLS + tabela staff)
+
+O dinheiro NUNCA passa pela conta do MA24 nem pelo site: entra na conta
+Asaas do cliente, e o próprio Asaas separa a parte do MA24 (split).
+
+
+-------------------------------------------------------------------------------
+ 2. REGRAS QUE NÃO SE QUEBRAM
+-------------------------------------------------------------------------------
+
+ 1. Dinheiro em CENTAVOS (integer). Nunca float. Converte para reais só na
+    chamada ao Asaas (centavos / 100) e na tela.
+ 2. O valor NUNCA vem do navegador. Plano recorrente: o navegador manda o
+    CÓDIGO do plano e o servidor busca o valor numa tabela no código
+    (lib/doacoes/planos.ts). Valor livre: o servidor confere mínimo e máximo.
+ 3. "Pago" só vem do WEBHOOK. O site nunca marca nada como pago sozinho,
+    nem quando o doador clica em "já paguei".
+ 4. Webhook autenticado (token no cabeçalho asaas-access-token, comparação
+    em tempo constante) e IDEMPOTENTE (id do evento é chave primária; o
+    Asaas reenvia).
+ 5. Cartão nunca passa pelo site: o doador digita na página do Asaas
+    (invoiceUrl). Zero dado de cartão no nosso código.
+ 6. Split no Asaas em TODA cobrança e assinatura. Nunca repasse manual.
+    O percentual é variável de ambiente, não código.
+ 7. Tabelas com PREFIXO do cliente, RLS ligada. Escrita só pelo servidor
+    (service_role) dentro de app/api/**. Página nunca usa service_role.
+ 8. Painel protegido por TABELA DE STAFF, não só por "estar logado":
+    se o projeto Supabase for compartilhado, o auth.users é de todos.
+ 9. Modo demo: sem variáveis, o site roda com dados falsos e AVISA na tela
+    ("modo demonstração", persistido: false). Nunca falhar em silêncio.
+10. LGPD: política de privacidade + consentimento obrigatório no checkout
+    (checado também no servidor). Ver seção 10.
+
+
+-------------------------------------------------------------------------------
+ 3. CONTAS NECESSÁRIAS (todas no e-mail do MA24, senha nossa)
+-------------------------------------------------------------------------------
+
+ASAAS — conta DO CLIENTE (CPF/CNPJ dele), criada por nós
+  - Sandbox para desenvolver: https://sandbox.asaas.com (conta separada).
+  - Produção: precisa de documentos do cliente e aprovação do Asaas.
+  - Cadastrar CHAVE PIX na conta (sem ela o Pix falha, inclusive no sandbox).
+  - Gerar chave de API SEM EXPIRAÇÃO (Integrações > Chaves de API).
+    Chave com validade curta parou no meio do dia no terreiro.
+  - Webhook (Integrações > Webhooks):
+      URL:    https://<dominio>/api/asaas/webhook
+      Token:  o mesmo valor de ASAAS_WEBHOOK_TOKEN
+      Eventos: de cobrança (PAYMENT_*)
+      Só dá para cadastrar com o site publicado (precisa de URL pública).
+
+ASAAS — conta DO MA24 (já existe, uma só para todos os clientes)
+  - Dela só sai o WALLET ID (Integrações > ... "Wallet ID"), que vai na
+    variável ASAAS_WALLET_ID_MA24 de cada site.
+  - A carteira do split NÃO pode ser a da conta que cria a cobrança: o
+    Asaas recusa. Ou seja, nunca testar split com a conta do MA24 emitindo.
+
+SUPABASE
+  - Opção A (preferida para site com estagiário): projeto Free PRÓPRIO do
+    site. Isola as chaves: quem tem a service_role não enxerga outros
+    clientes. Projeto Free pausa após 7 dias sem consulta -> cron diário
+    em /api/saude (seção 6).
+  - Opção B: projeto compartilhado do MA24. Aí o prefixo e a tabela de
+    staff deixam de ser disciplina e passam a ser a única proteção.
+  - Criar o usuário do painel em Authentication > Users e inserir o id dele
+    na tabela <prefixo>_staff.
+
+VERCEL
+  - Projeto ligado ao repositório GitHub; "git push origin main" publica.
+    Não rodar "vercel deploy" junto com o push (deploy duplicado).
+  - Plano Hobby + repositório privado: a Vercel BLOQUEIA o deploy quando o
+    AUTOR DO COMMIT não é membro do time ("Deployment Blocked"). O e-mail
+    do autor (git config user.email) tem que ser de uma conta GitHub
+    ligada à conta Vercel dona do projeto.
+  - Variáveis de ambiente em Settings > Environment Variables (seção 4).
+  - vercel.json com o cron da /api/saude.
+
+GITHUB
+  - Repositório privado na org/conta do MA24. Conferir antes de todo push
+    qual conta e qual e-mail estão configurados (não misturar contas).
+
+
+-------------------------------------------------------------------------------
+ 4. VARIÁVEIS DE AMBIENTE
+-------------------------------------------------------------------------------
+
+Arquivo .env.local (local, NUNCA no git) e as mesmas na Vercel.
+Deixe um .env.example no repositório, sem valores.
+
+  NOME                            ONDE PEGAR                         QUEM USA
+  ------------------------------  ---------------------------------  ----------
+  NEXT_PUBLIC_SUPABASE_URL        Supabase > Project Settings > API  navegador
+                                  (https://<ref>.supabase.co)        e servidor
+  NEXT_PUBLIC_SUPABASE_ANON_KEY   Supabase > API Keys > chave        navegador
+                                  publicável (sb_publishable_...)    e servidor
+                                  ou a "anon" antiga
+  SUPABASE_SERVICE_ROLE_KEY       Supabase > API Keys > chave        SÓ servidor
+                                  secreta (sb_secret_...) ou a       (app/api/**)
+                                  "service_role" antiga
+  ASAAS_AMBIENTE                  "sandbox" ou "producao"            servidor
+                                  (decide a URL da API)
+  ASAAS_API_KEY                   Asaas da conta do CLIENTE >        SÓ servidor
+                                  Integrações > Chaves de API
+                                  (sem expiração). Sandbox e
+                                  produção têm chaves diferentes.
+  ASAAS_WALLET_ID_MA24            Asaas da conta do MA24 > Wallet ID SÓ servidor
+  REPASSE_PERCENTUAL              Combinado com o Pierre (ex.: 10)   SÓ servidor
+  ASAAS_WEBHOOK_TOKEN             Inventado por nós (string longa    SÓ servidor
+                                  aleatória); o MESMO valor vai no
+                                  cadastro do webhook no Asaas
+
+Gerar um token forte:  node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+
+Regras:
+  - Só o que começa com NEXT_PUBLIC_ chega ao navegador. Chave do Asaas,
+    service_role, wallet e token NUNCA levam esse prefixo.
+  - NEXT_PUBLIC_* é embutido no BUILD: mudou na Vercel, precisa redeploy.
+  - Sem ASAAS_API_KEY -> Asaas em modo demo. Sem Supabase -> nada gravado.
+  - ATENÇÃO: sem ASAAS_WALLET_ID_MA24 a cobrança nasce SEM split e o código
+    atual não avisa. Ver melhoria 13.1.
+
+URLs da API do Asaas:
+  sandbox:   https://api-sandbox.asaas.com/v3
+  produção:  https://api.asaas.com/v3
+  Cabeçalho: access_token: <ASAAS_API_KEY>  (e um user-agent qualquer)
+
+
+-------------------------------------------------------------------------------
+ 5. ESTRUTURA DE ARQUIVOS (copiar do terreiro)
+-------------------------------------------------------------------------------
+
+  app/
+    api/doacao/route.ts          ÚNICA porta de entrada de dinheiro
+    api/doacao/status/route.ts   só LÊ o status (tela do Pix)
+    api/asaas/webhook/route.ts   única fonte de "pago"
+    api/saude/route.ts           batida diária (Supabase Free não pausar)
+    doar/page.tsx                link curto -> abre o checkout
+    privacidade/page.tsx         política de privacidade (LGPD)
+    login/                       login do painel (usuário -> e-mail interno)
+    painel/                      painel do cliente (layout chama requireStaff)
+  components/checkout/           checkout (client) -> POST /api/doacao
+  lib/
+    config/site.ts               ÚNICO lugar com dados do cliente
+    config/privacidade.ts        versão da política aceita
+    doacoes/planos.ts            planos, valores e limites (centavos)
+    asaas/cliente.ts             cliente do Asaas com split; modo demo
+    supabase/{server,client,proxy}.ts
+    auth/requireStaff.ts         única autorização do painel
+    auth/usuario.ts              "usuario" -> usuario@<cliente>.ma24.com.br
+  proxy.ts                       (Next 16: proxy.ts, não middleware.ts)
+                                 renova sessão e manda /painel sem login
+                                 para /login
+  supabase/migrations/           0001 (tabelas + RLS), 0002 (consentimento)
+  vercel.json                    cron diário da /api/saude
+  .env.example
+
+Pacotes: next, react, @supabase/ssr, @supabase/supabase-js, zod,
+server-only. Nenhum SDK do Asaas: é fetch direto (lib/asaas/cliente.ts).
+
+Se o outro site não for Next.js, a arquitetura vale igual: o que importa é
+existir um servidor com estas 4 rotas e as chaves só nele.
+
+
+-------------------------------------------------------------------------------
+ 6. BANCO (Supabase / Postgres) — trocar "terreiro_" pelo prefixo
+-------------------------------------------------------------------------------
+
+  <p>_config           1 linha (id = 1): nome de exibição, WhatsApp...
+                       Leitura pública. NÃO APAGAR: /api/saude lê dela.
+  <p>_staff            user_id (auth.users) de quem entra no painel
+  <p>_doadores         asaas_customer_id (unique), nome, email, telefone
+                       (cpf_cnpj existe mas fica NULL: CPF vai só ao Asaas)
+  <p>_assinaturas      doador_id, asaas_subscription_id (unique), plano,
+                       valor_centavos, forma (pix|cartao), status
+                       (ativa|cancelada), criado_em, cancelado_em
+  <p>_doacoes          doador_id, assinatura_id (null se avulsa), tipo
+                       (mensal|avulsa), forma, valor_centavos,
+                       repasse_centavos (bruto - líquido, pelo webhook),
+                       status (pendente|pago|vencido|cancelado|estornado),
+                       asaas_payment_id (unique), referencia (unique,
+                       16 hex aleatórios), pago_em, consentimento_em,
+                       politica_versao, criado_em, atualizado_em
+  <p>_asaas_eventos    id do evento (PK = idempotência), tipo, payment_id,
+                       payload jsonb, recebido_em
+
+RLS:
+  - Todas com RLS ligada.
+  - Função <p>_e_staff() (security definer) = existe linha em <p>_staff
+    para auth.uid().
+  - SELECT para authenticated quando <p>_e_staff(): doadores, assinaturas,
+    doações. <p>_staff: cada um só vê a própria linha. <p>_config: pública.
+  - <p>_asaas_eventos: sem política nenhuma (só service_role).
+  - Nenhuma política de INSERT/UPDATE: escrita só pelo servidor.
+
+Aplicar migração: SQL Editor do Supabase (colar e Run) ou Supabase CLI.
+Migração nova que adiciona coluna usada pelo código: aplicar ANTES do
+deploy, senão o insert falha.
+
+Cron (vercel.json):
+  { "crons": [ { "path": "/api/saude", "schedule": "0 9 * * *" } ] }
+
+
+-------------------------------------------------------------------------------
+ 7. FLUXOS
+-------------------------------------------------------------------------------
+
+7.1 Avulsa (valor livre) — Pix
+  1. POST /api/doacao {tipo:"avulsa", forma:"pix", valorCentavos, nome,
+     email, cpfCnpj, telefone, consentimento:true}
+  2. Servidor: limites (mín. R$ 5,00 — o Asaas recusa menos), cliente no
+     Asaas (busca por CPF/e-mail antes de criar: o Asaas não deduplica),
+     POST /payments {billingType:"PIX", value, dueDate:hoje,
+     externalReference:referencia, split:[...]}, depois
+     GET /payments/{id}/pixQrCode.
+  3. Grava doador + doação "pendente". Devolve QR + copia-e-cola + referencia.
+  4. A tela consulta GET /api/doacao/status?referencia=... a cada 4 s.
+  5. Webhook PAYMENT_RECEIVED -> "pago" -> a tela mostra o recibo.
+
+7.2 Mensal — cartão (automático)
+  1. POST /subscriptions {billingType:"CREDIT_CARD", cycle:"MONTHLY",
+     nextDueDate:hoje, value, split:[...]}
+  2. GET /subscriptions/{id}/payments?limit=1 -> 1ª cobrança -> invoiceUrl.
+  3. O navegador vai para o invoiceUrl; o doador cadastra o cartão no
+     Asaas. Os meses seguintes são cobrados sozinhos.
+
+7.3 Mensal — Pix (NÃO é automático)
+  Igual à 7.2 com billingType:"PIX". Todo mês o Asaas gera uma cobrança e
+  manda o link por e-mail/SMS; o doador paga de novo. EXPLICAR NA TELA.
+  (Notificações do Asaas precisam estar ligadas no cliente.)
+
+7.4 Webhook (app/api/asaas/webhook)
+  1. Token confere? Senão 401.
+  2. INSERT do evento em <p>_asaas_eventos. Erro 23505 (duplicado) =
+     reenvio -> responde 200 e não faz nada.
+  3. Mapa de eventos:
+       PAYMENT_CREATED / UPDATED       -> pendente
+       PAYMENT_CONFIRMED / RECEIVED    -> pago (grava pago_em e
+                                          repasse_centavos = value - netValue)
+       PAYMENT_OVERDUE                 -> vencido
+       PAYMENT_DELETED                 -> cancelado
+       PAYMENT_REFUNDED / CHARGEBACK_* -> estornado
+  4. Cobrança de assinatura que ainda não existe no banco (mês novo):
+     acha a assinatura por payment.subscription e cria a doação do mês.
+  5. Responder 200 rápido; o Asaas reenvia o que não recebe 200.
+
+7.5 Cancelar assinatura
+  DELETE /subscriptions/{id} (função cancelarAssinatura já existe).
+  Ainda não há botão no painel nem fluxo para o doador: hoje é pelo
+  painel do Asaas. Ver melhoria 13.4.
+
+
+-------------------------------------------------------------------------------
+ 8. SPLIT (a parte do MA24)
+-------------------------------------------------------------------------------
+
+  split: [{ walletId: ASAAS_WALLET_ID_MA24, percentualValue: REPASSE_PERCENTUAL }]
+
+  - Vai em TODA cobrança (/payments) e assinatura (/subscriptions).
+    As cobranças mensais herdam o split da assinatura.
+  - O percentual incide sobre o VALOR LÍQUIDO (depois da tarifa do Asaas),
+    não sobre o bruto. Doc: "O Split é calculado sobre o netValue".
+    Para cobrar sobre o bruto, usar fixedValue calculado por plano.
+  - Não há mínimo por carteira na doc: centavos funcionam. O mínimo de
+    R$ 5,00 é da COBRANÇA.
+  - Assinatura já criada guarda o split de quando nasceu. Mudou o
+    percentual? Atualizar as assinaturas ativas pela API (melhoria 13.2).
+  - Conferir um split real: GET /payments/{id} ou o painel do Asaas
+    (a doc cita /payments/{id}/splits).
+  - Primeiro teste com split: menor valor possível, com o Wallet ID real
+    do MA24 e a conta do CLIENTE emitindo.
+
+Exemplos com 10% e tarifa cheia (out/2026):
+  Pix R$ 10   -> líquido R$ 8,01  -> MA24 R$ 0,80
+  Pix R$ 50   -> líquido R$ 48,01 -> MA24 R$ 4,80
+  Cartão R$ 50 -> líquido ~R$ 48,02 -> MA24 ~R$ 4,80
+
+
+-------------------------------------------------------------------------------
+ 9. TAXAS DO ASAAS (tabela pública, consultada em 04/10/2026)
+-------------------------------------------------------------------------------
+
+  Pix ......................... R$ 1,99 por cobrança (R$ 0,99 nos 3 primeiros meses)
+  Cartão de crédito à vista ... R$ 0,49 + 2,99%     (R$ 0,49 + 1,99% promo)
+  Cartão de débito ............ R$ 0,35 + 1,89%
+  Boleto ...................... R$ 1,99            (R$ 0,99 promo)
+  Notificação WhatsApp ........ R$ 0,55 / pacote e-mail+SMS R$ 0,99
+  Transferência Pix ........... 30 grátis/mês, depois R$ 2,00
+  Fonte: https://www.asaas.com/precos-e-taxas
+  Em valores pequenos a tarifa pesa muito (R$ 5 no Pix -> R$ 3,01 líquido).
+
+
+-------------------------------------------------------------------------------
+ 10. LGPD (mínimo para ir ao ar)
+-------------------------------------------------------------------------------
+
+  - Página /privacidade: controlador (razão social, CNPJ, contato), dados
+    coletados e finalidade, base legal, compartilhamento (Asaas, Supabase,
+    Vercel, MA24 como OPERADOR), "podem ser armazenados fora do Brasil",
+    retenção (enquanto ativo + prazo legal fiscal), direitos do art. 18 e
+    canal (e-mail do cliente), cookies, versão e data. Link no rodapé e no
+    checkout. Texto passa por revisão jurídica.
+  - Caixa de consentimento no checkout, desmarcada, obrigatória; o servidor
+    recusa sem ela (consentimento: z.literal(true)). Gravar
+    consentimento_em e politica_versao em cada doação.
+  - Coletar só o necessário. CPF só para o Asaas, não guardar no banco.
+  - Dado sensível: doação a entidade RELIGIOSA (convicção religiosa),
+    política, sindical ou de saúde é dado sensível (art. 5º, II e 11):
+    consentimento específico e destacado é obrigatório. Loja ou clube
+    comum: a base pode ser execução de contrato, mas manter política e aviso.
+  - Sem analytics/pixel = sem banner de cookies (cookies de login do painel
+    são necessários). Pôs analytics? Aí precisa de banner.
+  - Contrato/termo MA24 (operador) x cliente (controlador).
+
+
+-------------------------------------------------------------------------------
+ 11. PASSO A PASSO PARA UM SITE NOVO
+-------------------------------------------------------------------------------
+
+  1. Definir com o Pierre: planos e valores (centavos), se tem valor livre,
+     formas (Pix, cartão), percentual do MA24, prefixo das tabelas,
+     Supabase próprio ou compartilhado.
+  2. Copiar do terreiro: lib/asaas, lib/supabase, lib/auth, lib/doacoes,
+     lib/config/privacidade.ts, app/api/**, app/login, app/painel,
+     app/privacidade, components/checkout, proxy.ts, vercel.json,
+     supabase/migrations, .env.example.
+  3. Trocar o prefixo terreiro_ em TUDO (tabelas, função, políticas,
+     índices, código) e o domínio interno de login (lib/auth/usuario.ts).
+  4. Ajustar lib/config/site.ts (dados do cliente) e lib/doacoes/planos.ts.
+  5. Adaptar textos: "doação" vs "assinatura", nomes dos planos, nota do
+     Pix mensal, política de privacidade.
+  6. Rodar em modo demo (sem .env.local): fluxo inteiro, lint e build.
+  7. Supabase: aplicar migrações, conferir RLS (anônimo não lê doações),
+     criar usuário do painel e inserir em <p>_staff.
+  8. Asaas SANDBOX: chave sem expiração, chave Pix, testar mensal no
+     cartão, mensal no Pix e avulsa.
+  9. Publicar na Vercel com as variáveis; cadastrar o webhook (URL + token)
+     e ver uma doação virar "pago" sozinha.
+ 10. Asaas PRODUÇÃO na conta do cliente + Wallet ID do MA24 preenchido;
+     um teste com o menor valor conferindo o split no Asaas.
+ 11. Revisão final (seção 12) e STATUS.md em dia.
+
+
+-------------------------------------------------------------------------------
+ 12. CHECKLIST ANTES DE IR AO AR
+-------------------------------------------------------------------------------
+
+  [ ] ASAAS_AMBIENTE=producao e chave da conta DO CLIENTE (não de teste)
+  [ ] ASAAS_WALLET_ID_MA24 preenchido e split conferido numa cobrança real
+  [ ] REPASSE_PERCENTUAL combinado
+  [ ] Webhook cadastrado na conta de produção, token igual ao da Vercel;
+      webhook da conta de teste apagado
+  [ ] Webhook sem token responde 401
+  [ ] Painel: usuário sem linha em <p>_staff não entra
+  [ ] Anônimo não lê <p>_doacoes / <p>_doadores (testar com a chave pública)
+  [ ] /privacidade revisada, consentimento funcionando (400 sem ele)
+  [ ] Cron da /api/saude ativo (Vercel > Settings > Cron Jobs)
+  [ ] Dados e assinaturas de teste removidos (Asaas e Supabase), sem apagar
+      a linha de <p>_config
+  [ ] Assinaturas criadas em conta temporária canceladas (não migram entre
+      contas: o doador assina de novo)
+  [ ] npm audit sem vulnerabilidade crítica; Next na versão corrigida
+  [ ] Entrega: trocar senhas, 2FA com telefone nosso, encerrar sessões
+
+
+-------------------------------------------------------------------------------
+ 13. MELHORIAS QUE AINDA FALTAM NO TERREIRO (fazer já nos próximos)
+-------------------------------------------------------------------------------
+
+ 13.1 Trava do split: em produção, sem ASAAS_WALLET_ID_MA24, recusar a
+      doação (erro claro no log) em vez de cobrar sem split. Exceção
+      explícita por variável (ex.: PERMITIR_SEM_SPLIT=1) só para conta de
+      teste.
+ 13.2 scripts/atualizar-split.js: lista assinaturas ativas e aplica o
+      percentual atual (conferir na doc do Asaas o endpoint de atualizar
+      assinatura).
+ 13.3 Cobrança órfã: hoje o banco só é gravado depois do Asaas responder
+      tudo (inclusive o QR). Se o QR falha, a cobrança fica no Asaas sem
+      linha no banco. Gravar a doação logo após criar a cobrança, ou
+      cancelar a cobrança se a etapa seguinte falhar.
+ 13.4 Cancelamento: botão no painel (e/ou link para o doador) que chama
+      DELETE /subscriptions/{id} e marca a assinatura como cancelada.
+ 13.5 Webhook: tratar eventos de assinatura (SUBSCRIPTION_*) se o cliente
+      quiser ver no painel assinaturas canceladas pelo Asaas.
+
+
+-------------------------------------------------------------------------------
+ 14. ARMADILHAS JÁ VIVIDAS
+-------------------------------------------------------------------------------
+
+  - Chave de API do Asaas com validade curta: parou às 16h30 com "chave de
+    API fornecida é inválida". Sempre sem expiração.
+  - Asaas recusa cobrança abaixo de R$ 5,00.
+  - Pix falha se a conta (até a sandbox) não tem chave Pix cadastrada.
+  - Apagar <p>_config ao limpar testes derruba a /api/saude.
+  - Supabase Free pausa com 7 dias sem consulta (daí o cron).
+  - Vercel Hobby bloqueia deploy de commit cujo autor não é do time.
+  - next dev em pasta com parênteses no nome deu 404 em tudo menos "/";
+    next build + next start funcionam. Se o dev quebrar os tipos, apagar
+    .next/dev.
+  - Next 16 tem mudanças de API: ler node_modules/next/dist/docs antes de
+    escrever código; usar proxy.ts (middleware.ts foi renomeado).
+  - Supabase compartilhado: auth.users é de todos os clientes. Login sem
+    checar a tabela de staff deixa usuário de outro cliente entrar.
+===============================================================================

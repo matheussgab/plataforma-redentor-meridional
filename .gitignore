@@ -1,0 +1,13 @@
+node_modules/
+.next/
+out/
+.env*
+!.env.example
+*.tsbuildinfo
+next-env.d.ts
+artifacts/
+*.log
+
+# Dados sensíveis do cliente: ficam só na máquina
+contexto.txt
+assets/insta-post-*
