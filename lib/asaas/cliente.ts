@@ -38,9 +38,11 @@ function percentualRepasse(): number {
  * ASAAS_WALLET_ID_MA24, a cobrança é RECUSADA em vez de nascer sem split. A
  * exceção é explícita (PERMITIR_SEM_SPLIT=1), só para conta de teste.
  */
-function split() {
+function split(tipo: "única" | "recorrente", forma: "pix" | "cartao") {
   const wallet = process.env.ASAAS_WALLET_ID_MA24;
-  if (wallet) return [{ walletId: wallet, percentualValue: percentualRepasse() }];
+  // A descrição aparece em "Splits recebidos" na conta do MA24.
+  const description = `Redentor Meridional - contribuição ${tipo} (${forma === "pix" ? "Pix" : "cartão"})`;
+  if (wallet) return [{ walletId: wallet, percentualValue: percentualRepasse(), description }];
   if (AMBIENTE === "producao" && process.env.PERMITIR_SEM_SPLIT !== "1") {
     throw new Error("ASAAS_WALLET_ID_MA24 vazio em produção: cobrança recusada para não nascer sem split");
   }
@@ -114,7 +116,7 @@ export async function criarContribuicaoUnica(clienteId: string, centavos: number
     dueDate: hoje(),
     description: "Contribuição única - Redentor Meridional",
     externalReference: referencia,
-    split: split(),
+    split: split("única", forma),
     callback: callback(),
   });
   const cob: Cobranca = { id: p.id, status: p.status, invoiceUrl: p.invoiceUrl };
@@ -141,20 +143,37 @@ export async function criarContribuicaoRecorrente(clienteId: string, centavos: n
     cycle: "MONTHLY",
     description: "Contribuição recorrente - Redentor Meridional",
     externalReference: referencia,
-    split: split(),
+    split: split("recorrente", forma),
     callback: callback(),
   });
   try {
     // A primeira cobrança já existe; é ela que a pessoa paga agora.
-    const lista = await chamar<{ data: { id: string; status: string; invoiceUrl: string }[] }>(`/subscriptions/${s.id}/payments?limit=1`, undefined, "GET");
+    const lista = await chamar<{ data: { id: string; status: string; invoiceUrl: string; billingType: string; value: number; dueDate: string }[] }>(`/subscriptions/${s.id}/payments?limit=1`, undefined, "GET");
     const p = lista.data[0];
     if (!p) throw new Error("contribuição recorrente criada sem a primeira cobrança");
+    await retornoNaCobranca(p);
     const cob: Cobranca & { recorrenteId: string } = { id: p.id, status: p.status, invoiceUrl: p.invoiceUrl, recorrenteId: s.id };
     if (forma === "pix") cob.pix = await qrPix(p.id);
     return cob;
   } catch (e) {
     await cancelarRecorrente(s.id);
     throw e;
+  }
+}
+
+/**
+ * A 1ª cobrança da recorrente nasce junto com ela e nem sempre herda o
+ * callback; sem ele, quem cadastra o cartão fica parado na página do Asaas.
+ * Grava o retorno direto na cobrança. Falha aqui só vai para o log: o
+ * pagamento funciona igual, só não volta sozinho ao site.
+ */
+async function retornoNaCobranca(p: { id: string; billingType: string; value: number; dueDate: string }) {
+  const cb = callback();
+  if (!cb) return;
+  try {
+    await chamar(`/payments/${p.id}`, { billingType: p.billingType, value: p.value, dueDate: p.dueDate, callback: cb }, "PUT");
+  } catch (e) {
+    console.error("[asaas] retorno ao site não gravado na cobrança", p.id, e instanceof Error ? e.message : e);
   }
 }
 

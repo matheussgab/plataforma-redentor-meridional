@@ -11,3 +11,4 @@ artifacts/
 # Dados sensíveis do cliente: ficam só na máquina
 contexto.txt
 assets/insta-post-*
+asaas_api_key.txt
